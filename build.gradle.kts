@@ -26,6 +26,8 @@ recipeDependencies {
     parserClasspath("org.powermock:powermock-core:1.7.+")
     parserClasspath("com.squareup.okhttp3:mockwebserver:4.10.0")
     parserClasspath("org.springframework:spring-test:6.1.12")
+    parserClasspath("org.springframework:spring-webflux:6.1.12")
+    parserClasspath("io.rest-assured:rest-assured:5.5.0")
 }
 
 val rewriteVersion = rewriteRecipe.rewriteVersion.get()
