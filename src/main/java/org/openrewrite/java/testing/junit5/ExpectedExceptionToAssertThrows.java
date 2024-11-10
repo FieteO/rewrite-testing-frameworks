@@ -15,6 +15,9 @@
  */
 package org.openrewrite.java.testing.junit5;
 
+import java.util.Collections;
+import java.util.List;
+
 import org.jspecify.annotations.Nullable;
 import org.openrewrite.ExecutionContext;
 import org.openrewrite.Preconditions;
@@ -25,11 +28,13 @@ import org.openrewrite.java.JavaIsoVisitor;
 import org.openrewrite.java.JavaParser;
 import org.openrewrite.java.JavaTemplate;
 import org.openrewrite.java.search.UsesType;
-import org.openrewrite.java.tree.*;
+import org.openrewrite.java.tree.Expression;
+import org.openrewrite.java.tree.J;
+import org.openrewrite.java.tree.JavaType;
+import org.openrewrite.java.tree.NameTree;
+import org.openrewrite.java.tree.Statement;
+import org.openrewrite.java.tree.TypeUtils;
 import org.openrewrite.staticanalysis.LambdaBlockToExpression;
-
-import java.util.Collections;
-import java.util.List;
 
 /**
  * Replace usages of JUnit 4's @Rule ExpectedException with JUnit 5 Assertions.
@@ -62,6 +67,7 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
 
     public static class ExpectedExceptionToAssertThrowsVisitor extends JavaIsoVisitor<ExecutionContext> {
 
+        private static final String EXPECTED_EXCEPTION_FQN = "org.junit.rules.ExpectedException";
         private JavaParser.@Nullable Builder<?, ?> javaParser;
 
         private JavaParser.Builder<?, ?> javaParser(ExecutionContext ctx) {
@@ -77,20 +83,15 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
         public J.ClassDeclaration visitClassDeclaration(J.ClassDeclaration classDecl, ExecutionContext ctx) {
             J.ClassDeclaration cd = super.visitClassDeclaration(classDecl, ctx);
 
-            cd = cd.withBody(cd.getBody().withStatements(ListUtils.map(cd.getBody().getStatements(), statement -> {
-                if (statement instanceof J.VariableDeclarations) {
-                    //noinspection ConstantConditions
-                    if (TypeUtils.isOfClassType(((J.VariableDeclarations) statement).getTypeExpression().getType(),
-                            "org.junit.rules.ExpectedException")) {
-                        maybeRemoveImport("org.junit.Rule");
-                        maybeRemoveImport("org.junit.rules.ExpectedException");
-                        return null;
-                    }
-                }
-                return statement;
-            })));
+            return removeRulesVariableDeclarations(cd);
+        }
 
-            return cd;
+        private boolean isArgValid(Expression arg, String expectedFullyQualifiedName) {
+            JavaType.FullyQualified argType = TypeUtils.asFullyQualified(arg.getType());
+            if (!isHamcrestMatcher(arg) && (argType == null || !expectedFullyQualifiedName.equals(argType.getFullyQualifiedName()))) {
+                return false;
+            }
+            return true;
         }
 
         @Override
@@ -117,11 +118,7 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
                 if (args.size() != 1) {
                     return m;
                 }
-
-                Expression expectMethodArg = args.get(0);
-                isExpectArgAMatcher = isHamcrestMatcher(expectMethodArg);
-                JavaType.FullyQualified argType = TypeUtils.asFullyQualified(expectMethodArg.getType());
-                if (!isExpectArgAMatcher && (argType == null || !"java.lang.Class".equals(argType.getFullyQualifiedName()))) {
+                if(!isArgValid(args.get(0),"java.lang.Class")) {
                     return m;
                 }
             }
@@ -132,10 +129,7 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
                 if (args.size() != 1) {
                     return m;
                 }
-
-                final Expression expectMessageMethodArg = args.get(0);
-                isExpectMessageArgAMatcher = isHamcrestMatcher(expectMessageMethodArg);
-                if (!isExpectMessageArgAMatcher && !TypeUtils.isString(expectMessageMethodArg.getType())) {
+                if(!isArgValid(args.get(0),"java.lang.String")) {
                     return m;
                 }
             }
@@ -154,6 +148,8 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
                 }
             }
 
+            // String testError = "hi i'm a problem"; should be added here
+
             String exceptionDeclParam = ((isExpectArgAMatcher || isExpectMessageArgAMatcher || isExpectedCauseArgAMatcher) ||
                                          expectMessageMethodInvocation != null) ?
                     "Throwable exception = " : "";
@@ -161,6 +157,7 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
             Object expectedExceptionParam = (expectMethodInvocation == null || isExpectArgAMatcher) ?
                     "Exception.class" : expectMethodInvocation.getArguments().get(0);
 
+            // This adds Throwable exception = assertThrows(...)
             String templateString = expectedExceptionParam instanceof String ? "#{}assertThrows(#{}, () -> #{any()});" : "#{}assertThrows(#{any()}, () -> #{any()});";
             m = JavaTemplate.builder(templateString)
                     .contextSensitive()
@@ -232,7 +229,7 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
 
         @Override
         public J.MethodInvocation visitMethodInvocation(J.MethodInvocation method, ExecutionContext ctx) {
-            if (method.getMethodType() != null && "org.junit.rules.ExpectedException".equals(method.getMethodType().getDeclaringType().getFullyQualifiedName())) {
+            if (method.getMethodType() != null && EXPECTED_EXCEPTION_FQN.equals(method.getMethodType().getDeclaringType().getFullyQualifiedName())) {
                 switch (method.getSimpleName()) {
                     case "expect":
                         getCursor().putMessageOnFirstEnclosing(J.MethodDeclaration.class, "expectedExceptionMethodInvocation", method);
@@ -269,7 +266,28 @@ public class ExpectedExceptionToAssertThrows extends Recipe {
                 return false;
             }
 
-            return TypeUtils.isOfClassType(m.getMethodType().getDeclaringType(), "org.junit.rules.ExpectedException");
+            return TypeUtils.isOfClassType(m.getMethodType().getDeclaringType(), EXPECTED_EXCEPTION_FQN);
+        }
+
+        /**
+         * Removes <code>org.junit.Rule</code> and <code>org.junit.rules.ExpectedException</code> variable declarations.
+         * @param cd the {@link org.openrewrite.java.tree.J.ClassDeclaration}
+         * @return the class without <code>Rule</code> and <code>ExpectedException</code> declarations
+         */
+        private J.ClassDeclaration removeRulesVariableDeclarations(J.ClassDeclaration cd) {
+            cd = cd.withBody(cd.getBody().withStatements(ListUtils.map(cd.getBody().getStatements(), statement -> {
+                if (statement instanceof J.VariableDeclarations) {
+                    //noinspection ConstantConditions
+                    if (TypeUtils.isOfClassType(((J.VariableDeclarations) statement).getTypeExpression().getType(),
+                            EXPECTED_EXCEPTION_FQN)) {
+                        maybeRemoveImport("org.junit.Rule");
+                        maybeRemoveImport(EXPECTED_EXCEPTION_FQN);
+                        return null;
+                    }
+                }
+                return statement;
+            })));
+            return cd;
         }
     }
 }
